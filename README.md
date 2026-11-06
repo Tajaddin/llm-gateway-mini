@@ -1,6 +1,6 @@
 # llm-gateway-mini
 
-> Multi-tenant LLM proxy in ~800 lines: per-tenant API keys, HMAC request signing, token-bucket rate limiting, daily-token + monthly-cost quotas, append-only SQLite audit log. Concurrent benchmark: **10 tenants × 200 requests, 276 QPS, p99 = 69.2 ms** end-to-end through the full middleware stack, 0 errors, 2000 audit rows written.
+> Multi-tenant LLM proxy in ~700 lines of Python (not counting blanks, comments or docstrings): per-tenant API keys, HMAC request signing, token-bucket rate limiting, daily-token + monthly-cost quotas, append-only SQLite audit log. Concurrent benchmark: **10 tenants × 200 requests, 276 QPS, p99 = 69.2 ms** end-to-end through the full middleware stack, 0 errors, 2000 audit rows written.
 
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![Tests](https://img.shields.io/badge/tests-55%20passing-brightgreen)](#tests) [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]()
 
