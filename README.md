@@ -1,8 +1,8 @@
 # llm-gateway-mini
 
-> Multi-tenant LLM proxy in ~600 lines: per-tenant API keys, HMAC request signing, token-bucket rate limiting, daily-token + monthly-cost quotas, append-only SQLite audit log. Concurrent benchmark: **10 tenants × 200 requests, 350 QPS, p99 = 41.7 ms** end-to-end through the full middleware stack, 0 errors, 2000 audit rows written.
+> Multi-tenant LLM proxy in ~800 lines: per-tenant API keys, HMAC request signing, token-bucket rate limiting, daily-token + monthly-cost quotas, append-only SQLite audit log. Concurrent benchmark: **10 tenants × 200 requests, 276 QPS, p99 = 69.2 ms** end-to-end through the full middleware stack, 0 errors, 2000 audit rows written.
 
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![Tests](https://img.shields.io/badge/tests-34%20passing-brightgreen)](#tests) [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]()
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![Tests](https://img.shields.io/badge/tests-54%20passing-brightgreen)](#tests) [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]()
 
 ## Why this exists
 
@@ -24,18 +24,20 @@ Every LLM-powered SaaS hits the same plumbing problem: you need to put a control
 ```json
 {
   "config": {"tenants": 10, "requests": 200, "backend_latency_ms": 2},
-  "wall_clock_seconds": 5.72,
+  "wall_clock_seconds": 7.246,
   "total_requests": 2000,
   "ok_count": 2000,
   "rate_limited_429": 0,
   "server_errors_5xx": 0,
-  "qps": 349.7,
-  "latency_ms": {"p50": 28.11, "p95": 38.02, "p99": 41.73, "p99_9": 46.13, "max": 47.45, "mean": 28.5},
+  "qps": 276.0,
+  "latency_ms": {"p50": 34.45, "p95": 53.84, "p99": 69.22, "p99_9": 102.18, "max": 108.84, "mean": 36.11},
   "audit_rows": 2000
 }
 ```
 
-Each of those 2000 requests passes through: API-key lookup → HMAC verify → rate-limit bucket acquire → quota pre-check → backend call → quota record → audit-log write. With a 2 ms mock backend, the **gateway's own overhead is the remaining ~26 ms at p50, ~40 ms at p99**, dominated by SQLite audit writes and Pydantic body validation.
+Median (by QPS) of three runs on a Windows 11 desktop with Python 3.12, 2026-11-06; the three runs gave 269–290 QPS and p99 69–71 ms. An earlier README reported 349.7 QPS and p99 41.73 ms from a different machine. The code before the November 2026 quota, pricing and signing fixes measured 259–298 QPS (p99 60–97 ms) on this one, so the added checks do not show up beyond run-to-run noise.
+
+Each of those 2000 requests passes through: API-key lookup → capped body read → HMAC verify + replay check → rate-limit bucket acquire → model allowlist → quota reservation → backend call → quota settle → audit-log write. With a 2 ms mock backend, the **gateway's own overhead is the remaining ~32 ms at p50, ~67 ms at p99**, dominated by SQLite audit writes and Pydantic body validation.
 
 Stress dimensions:
 
@@ -144,7 +146,7 @@ uvicorn.run(app, host="0.0.0.0", port=8000)
 
 * **`quota.py`** — `QuotaEnforcer.reserve(...)` checks an estimate against the tenant's `daily_token_budget` (UTC day-aligned) and `monthly_cost_cents` (UTC month-aligned) and holds it in the same locked step, raising `QuotaExceeded(kind=...)` if it does not fit. Concurrent requests therefore see each other's holds. `settle(...)` swaps the hold for the real usage once the backend replies; `release(...)` drops it if the call failed. Counters reset at the day/month boundary on next access — no scheduler required.
 
-* **`signing.py`** — `HmacSigner.sign(secret, body, timestamp)` returns `{X-Timestamp, X-Nonce, X-Signature}`. `verify(...)` checks HMAC-SHA256 against `f"{ts}.{nonce}.".encode() + body` and rejects if `|now - ts| > max_skew_seconds` (default 300). Uses `hmac.compare_digest` (constant time). Every accepted signature is remembered until its timestamp leaves the skew window, so replaying a captured request inside the window gets 401; the per-request nonce keeps two identical bodies sent in the same second distinct. Entries expire with the window, so the cache holds at most one window of accepted requests.
+* **`signing.py`** — `HmacSigner.sign(secret, body, timestamp)` returns `{X-Timestamp, X-Nonce, X-Signature}`. `verify(...)` checks HMAC-SHA256 against `f"{ts}.{nonce}.".encode() + body` and rejects if `|now - ts| > max_skew_seconds` (default 300). Uses `hmac.compare_digest` (constant time). Every accepted signature is remembered until its timestamp leaves the skew window, so replaying a captured request inside the window gets 401; the per-request nonce keeps two identical bodies sent in the same second distinct. Entries expire with the window, so the cache holds at most one window of accepted requests. Sign every attempt afresh: a retry that resends the same headers after a 429 or 502 counts as a replay.
 
 * **`audit.py`** — SQLite in WAL mode. Wide row: `received_at_ms`, `completed_at_ms`, `latency_ms`, `tenant_id`, `model`, `status`, `error_kind`, `input_tokens`, `output_tokens`, `cost_cents`, `request_id`. Indexed by `(tenant_id, received_at_ms)` and `status`.
 
@@ -162,15 +164,22 @@ pytest -v
 
 ```
 test_rate_limit.py    7 passed   bucket: empty/full/refill/exceptions/bad config
-test_quota.py         5 passed   daily/monthly budgets, named exceptions, tenant isolation
-test_signing.py       7 passed   roundtrip, wrong secret, body tamper, expired ts, missing/bad headers
+test_quota.py         8 passed   daily/monthly budgets, named exceptions, tenant isolation,
+                                 reserve/settle/release
+test_signing.py      12 passed   roundtrip, wrong secret, body tamper, expired ts, missing/bad headers,
+                                 replay rejected, fresh nonces accepted, nonce signed, cache expiry
 test_audit.py         3 passed   write/count/by-tenant/by-status/latencies
 test_tenants.py       3 passed   store lookup, fresh keys per Tenant.new
-test_gateway.py       9 passed   happy path, 401 unknown key, 401 bad sig, 429 rate limit,
+test_pricing.py       2 passed   sub-cent prices exact, float prices read as written
+test_backends.py      2 passed   Anthropic client streams with explicit timeout + retries
+test_gateway.py      17 passed   happy path, 401 unknown key, 401 bad sig, 429 rate limit,
                                  402 quota, signature-disabled flag, tenant isolation,
-                                 400 malformed body, /healthz
+                                 400 malformed body, /healthz, concurrent requests within budget,
+                                 prompt tokens counted, reservation released on 502,
+                                 400 unknown model, per-model cost, 401 before body read,
+                                 413 body cap, 401 replay
 ─────────────────────────────────
-34 passed in 1.24s
+54 passed in 1.86s
 ```
 
 Two tests worth calling out:
@@ -186,19 +195,20 @@ Two tests worth calling out:
 ├── src/llm_gateway/
 │   ├── tenants.py        # Tenant + TenantStore
 │   ├── rate_limit.py     # TokenBucket
-│   ├── quota.py          # QuotaEnforcer (daily tokens + monthly cost)
-│   ├── signing.py        # HmacSigner (sign + verify with ts skew check)
+│   ├── quota.py          # QuotaEnforcer (daily tokens + monthly cost, reserve/settle)
+│   ├── pricing.py        # ModelPrice + ANTHROPIC_PRICES (the model allowlist)
+│   ├── signing.py        # HmacSigner (sign + verify with ts skew check + replay cache)
 │   ├── audit.py          # AuditLog (SQLite WAL)
 │   ├── backends.py       # MockBackend + AnthropicBackend behind LLMBackend protocol
 │   ├── gateway.py        # FastAPI app + POST /v1/completions
 │   └── cli.py            # `llm-gateway` server
-├── tests/                # 34 pytest cases across 6 files
+├── tests/                # 54 pytest cases across 8 files
 └── bench/run_benchmark.py
 ```
 
 ## Limitations
 
-**In-memory state.** TenantStore, token buckets, and quota counters all live in process. A multi-replica deployment needs Redis (or similar) for these three. The interfaces are small and explicitly shaped for a swap.
+**In-memory state.** TenantStore, token buckets, quota counters and the replay cache all live in process. A multi-replica deployment needs Redis (or similar) for these four. The interfaces are small and explicitly shaped for a swap.
 
 **Synchronous SQLite audit.** With 2000 requests/run the audit DB is the dominant tail-latency contributor. Production deployments should buffer writes and flush in batches (or push to Kafka).
 
