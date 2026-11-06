@@ -63,7 +63,8 @@ Required request headers:
 |---|---|
 | `Authorization` | `Bearer <api_key>` |
 | `X-Timestamp` | unix seconds at sign time |
-| `X-Signature` | `v1=<hex_hmac_sha256(secret, "{ts}." + raw_body)>` |
+| `X-Nonce` | fresh random value per request, 16-128 chars of `[A-Za-z0-9_-]` |
+| `X-Signature` | `v1=<hex_hmac_sha256(secret, "{ts}.{nonce}." + raw_body)>` |
 | `Content-Type` | `application/json` |
 
 Response status codes:
@@ -72,7 +73,7 @@ Response status codes:
 |---|---|
 | 200 | Backend completed; usage recorded; audit row `status=ok` |
 | 400 | Body failed Pydantic validation, or `model` is not in the gateway's price table |
-| 401 | Unknown API key (checked before the body is read) OR signature invalid OR timestamp out of skew tolerance |
+| 401 | Unknown API key (checked before the body is read) OR signature invalid OR timestamp out of skew tolerance OR replay of an already-accepted signed request |
 | 402 | Daily-token or monthly-cost quota would be exceeded by this request |
 | 413 | Body longer than `max_body_bytes` (1 MiB by default); reading stops at the limit |
 | 429 | Token bucket empty for this tenant |
@@ -90,19 +91,20 @@ llm-gateway --backend anthropic --port 8000
 
 # in another shell — sign a request and POST it
 python - <<'PY'
-import json, time, hmac, hashlib, requests, os
+import json, time, hmac, hashlib, requests, secrets
 API_KEY = "sk_..."  # from the gateway's startup output
 SECRET  = "..."     # ditto
 body = json.dumps({"model": "claude-haiku-4-5-20251001",
                    "messages": [{"role": "user", "content": "say hi"}],
                    "max_tokens": 50}).encode()
 ts = int(time.time())
-sig = hmac.new(SECRET.encode(), f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
+nonce = secrets.token_urlsafe(16)
+sig = hmac.new(SECRET.encode(), f"{ts}.{nonce}.".encode() + body, hashlib.sha256).hexdigest()
 r = requests.post(
     "http://127.0.0.1:8000/v1/completions",
     data=body,
     headers={"Authorization": f"Bearer {API_KEY}",
-             "X-Timestamp": str(ts), "X-Signature": "v1="+sig,
+             "X-Timestamp": str(ts), "X-Nonce": nonce, "X-Signature": "v1="+sig,
              "Content-Type": "application/json"},
 )
 print(r.status_code, r.json())
@@ -142,7 +144,7 @@ uvicorn.run(app, host="0.0.0.0", port=8000)
 
 * **`quota.py`** — `QuotaEnforcer.reserve(...)` checks an estimate against the tenant's `daily_token_budget` (UTC day-aligned) and `monthly_cost_cents` (UTC month-aligned) and holds it in the same locked step, raising `QuotaExceeded(kind=...)` if it does not fit. Concurrent requests therefore see each other's holds. `settle(...)` swaps the hold for the real usage once the backend replies; `release(...)` drops it if the call failed. Counters reset at the day/month boundary on next access — no scheduler required.
 
-* **`signing.py`** — `HmacSigner.sign(secret, body, timestamp)` returns `{X-Timestamp, X-Signature}`. `verify(...)` checks HMAC-SHA256 against `"{ts}.".encode() + body` and rejects if `|now - ts| > max_skew_seconds` (default 300). Uses `hmac.compare_digest` (constant time).
+* **`signing.py`** — `HmacSigner.sign(secret, body, timestamp)` returns `{X-Timestamp, X-Nonce, X-Signature}`. `verify(...)` checks HMAC-SHA256 against `f"{ts}.{nonce}.".encode() + body` and rejects if `|now - ts| > max_skew_seconds` (default 300). Uses `hmac.compare_digest` (constant time). Every accepted signature is remembered until its timestamp leaves the skew window, so replaying a captured request inside the window gets 401; the per-request nonce keeps two identical bodies sent in the same second distinct. Entries expire with the window, so the cache holds at most one window of accepted requests.
 
 * **`audit.py`** — SQLite in WAL mode. Wide row: `received_at_ms`, `completed_at_ms`, `latency_ms`, `tenant_id`, `model`, `status`, `error_kind`, `input_tokens`, `output_tokens`, `cost_cents`, `request_id`. Indexed by `(tenant_id, received_at_ms)` and `status`.
 

@@ -5,7 +5,8 @@ Request lifecycle for ``POST /v1/completions``:
 1. Read API key from ``Authorization: Bearer <api_key>``. 401 if unknown,
    before any of the body is read.
 2. Read the body, at most ``max_body_bytes`` (413 past that), and verify the
-   HMAC signature against it + ``X-Timestamp``. 401 on fail.
+   HMAC signature over it + ``X-Timestamp`` + ``X-Nonce``. 401 on fail, or if
+   the same signed request was already accepted (replay).
 3. Acquire one token from the tenant's rate-limit bucket. 429 on empty.
 4. Reserve the estimated tokens + cost against the quota (prompt estimate
    plus ``max_tokens``). 402 if the reservation would pass a budget.
@@ -152,6 +153,7 @@ def create_app(
                     body,
                     timestamp_header=request.headers.get("x-timestamp"),
                     signature_header=request.headers.get("x-signature"),
+                    nonce_header=request.headers.get("x-nonce"),
                 )
             except SignatureInvalid as exc:
                 _audit("denied", "bad_signature", model="-")

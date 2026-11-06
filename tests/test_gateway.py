@@ -338,3 +338,16 @@ async def test_body_over_the_cap_is_rejected_while_streaming(tmp_path):
     code, pulled = await _raw_post(app, declared, [b"x" * 1000] * 5)
     assert code == 413
     assert pulled == []
+
+
+@pytest.mark.asyncio
+async def test_replayed_signed_request_is_rejected(tmp_path):
+    app, t, audit, signer, backend = _setup(tmp_path)
+    body = _body()
+    headers = _headers(t, body, signer)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+        first = await c.post("/v1/completions", content=body, headers=headers)
+        replay = await c.post("/v1/completions", content=body, headers=headers)
+    assert first.status_code == 200
+    assert replay.status_code == 401
+    assert backend.calls == 1
