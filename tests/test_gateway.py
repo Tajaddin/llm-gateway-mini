@@ -268,3 +268,73 @@ async def test_cost_follows_the_requested_models_price(tmp_path):
             costs[model] = r.json()["usage"]["cost_cents"]
     assert costs == {"cheap": 0.6, "pricey": 9.0}
     assert app.state.quota.snapshot("t1")["cost_cents_this_month"] == Decimal("9.6")
+
+
+async def _raw_post(app, headers, chunks):
+    """Drive the ASGI app directly; returns the status and the body messages
+    the app actually pulled from receive()."""
+    pending = [
+        {"type": "http.request", "body": c, "more_body": i < len(chunks) - 1}
+        for i, c in enumerate(chunks)
+    ]
+    pulled = []
+
+    async def receive():
+        if pending:
+            pulled.append(pending.pop(0))
+            return pulled[-1]
+        return {"type": "http.disconnect"}
+
+    status = {}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            status["code"] = message["status"]
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/completions",
+        "raw_path": b"/v1/completions",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(k.lower().encode(), v.encode()) for k, v in headers.items()],
+        "client": ("127.0.0.1", 1),
+        "server": ("test", 80),
+    }
+    await app(scope, receive, send)
+    return status["code"], pulled
+
+
+@pytest.mark.asyncio
+async def test_unknown_key_is_rejected_without_reading_the_body(tmp_path):
+    app, *_ = _setup(tmp_path)
+    code, pulled = await _raw_post(app, {"Authorization": "Bearer sk_bogus"}, [b"x" * 1000] * 5)
+    assert code == 401
+    assert pulled == []
+
+
+@pytest.mark.asyncio
+async def test_body_over_the_cap_is_rejected_while_streaming(tmp_path):
+    t = Tenant.new("t1")
+    tenants = TenantStore()
+    tenants.add(t)
+    app = create_app(
+        tenants,
+        MockBackend(),
+        AuditLog(tmp_path / "audit.sqlite"),
+        prices=PRICES,
+        require_signature=False,
+        max_body_bytes=1024,
+    )
+    code, pulled = await _raw_post(app, _auth(t), [b"x" * 1000] * 5)
+    assert code == 413
+    assert len(pulled) == 2  # stopped at the first chunk past the cap
+
+    declared = {**_auth(t), "Content-Length": "5000"}
+    code, pulled = await _raw_post(app, declared, [b"x" * 1000] * 5)
+    assert code == 413
+    assert pulled == []

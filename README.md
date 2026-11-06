@@ -72,12 +72,13 @@ Response status codes:
 |---|---|
 | 200 | Backend completed; usage recorded; audit row `status=ok` |
 | 400 | Body failed Pydantic validation, or `model` is not in the gateway's price table |
-| 401 | Unknown API key OR signature invalid OR timestamp out of skew tolerance |
+| 401 | Unknown API key (checked before the body is read) OR signature invalid OR timestamp out of skew tolerance |
 | 402 | Daily-token or monthly-cost quota would be exceeded by this request |
+| 413 | Body longer than `max_body_bytes` (1 MiB by default); reading stops at the limit |
 | 429 | Token bucket empty for this tenant |
 | 502 | Backend raised |
 
-Every code (even rejections) writes one row to `audit` with a named `error_kind`: `unknown_tenant`, `bad_signature`, `rate_limited`, `quota_daily_tokens`, `quota_monthly_cost`, `backend_error`, `bad_request`, `unknown_model`.
+Every code (even rejections) writes one row to `audit` with a named `error_kind`: `unknown_tenant`, `bad_signature`, `rate_limited`, `quota_daily_tokens`, `quota_monthly_cost`, `backend_error`, `bad_request`, `unknown_model`, `body_too_large`.
 
 ## Quickstart
 

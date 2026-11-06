@@ -2,8 +2,10 @@
 
 Request lifecycle for ``POST /v1/completions``:
 
-1. Read API key from ``Authorization: Bearer <api_key>``. 401 if unknown.
-2. Verify HMAC signature against the raw body + ``X-Timestamp``. 401 on fail.
+1. Read API key from ``Authorization: Bearer <api_key>``. 401 if unknown,
+   before any of the body is read.
+2. Read the body, at most ``max_body_bytes`` (413 past that), and verify the
+   HMAC signature against it + ``X-Timestamp``. 401 on fail.
 3. Acquire one token from the tenant's rate-limit bucket. 429 on empty.
 4. Reserve the estimated tokens + cost against the quota (prompt estimate
    plus ``max_tokens``). 402 if the reservation would pass a budget.
@@ -41,6 +43,19 @@ class GatewayError(Exception):
     pass
 
 
+async def _read_body(request: Request, limit: int) -> bytes | None:
+    """The request body, or None as soon as it is known to exceed ``limit``."""
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        return None
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > limit:
+            return None
+    return bytes(body)
+
+
 def _estimate_input_tokens(messages: list[dict]) -> int:
     """A deliberately high prompt-size estimate: one token per character of
     the JSON-serialized messages (tokenizers average several characters per
@@ -65,6 +80,7 @@ def create_app(
     signer: HmacSigner | None = None,
     require_signature: bool = True,
     rate_limit_cost_per_request: float = 1.0,
+    max_body_bytes: int = 1024 * 1024,
 ) -> FastAPI:
     quota = quota or QuotaEnforcer()
     signer = signer or HmacSigner()
@@ -97,7 +113,6 @@ def create_app(
     async def completions(request: Request):
         received_at_ms = int(time.time() * 1000)
         request_id = secrets.token_urlsafe(12)
-        body = await request.body()
 
         auth = request.headers.get("authorization", "")
         api_key = auth[len("Bearer ") :].strip() if auth.startswith("Bearer ") else ""
@@ -122,6 +137,13 @@ def create_app(
         if tenant is None:
             _audit("denied", "unknown_tenant", model="-")
             raise HTTPException(status_code=401, detail="unknown api key")
+
+        body = await _read_body(request, max_body_bytes)
+        if body is None:
+            _audit("denied", "body_too_large", model="-")
+            raise HTTPException(
+                status_code=413, detail=f"request body exceeds {max_body_bytes} bytes"
+            )
 
         if require_signature:
             try:
