@@ -213,7 +213,7 @@ async def test_concurrent_requests_cannot_overspend_the_daily_budget(tmp_path):
 async def test_quota_counts_prompt_tokens_not_just_max_tokens(tmp_path):
     t = Tenant.new("t1", daily_token_budget=1_000)
     backend = MockBackend()
-    app, audit = _unsigned_app(tmp_path, t, backend)
+    app, _ = _unsigned_app(tmp_path, t, backend)
     body = json.dumps(
         {"model": "m", "messages": [{"role": "user", "content": "x" * 8_000}], "max_tokens": 10}
     ).encode()
@@ -342,7 +342,7 @@ async def test_body_over_the_cap_is_rejected_while_streaming(tmp_path):
 
 @pytest.mark.asyncio
 async def test_replayed_signed_request_is_rejected(tmp_path):
-    app, t, audit, signer, backend = _setup(tmp_path)
+    app, t, _, signer, backend = _setup(tmp_path)
     body = _body()
     headers = _headers(t, body, signer)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
