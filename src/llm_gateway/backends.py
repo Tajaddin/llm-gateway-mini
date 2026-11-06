@@ -59,23 +59,40 @@ class MockBackend:
 
 
 class AnthropicBackend:
-    """Wraps :class:`anthropic.AsyncAnthropic`."""
+    """Wraps :class:`anthropic.AsyncAnthropic`.
 
-    def __init__(self, model: str | None = None, api_key: str | None = None) -> None:
+    The call is streamed and collected with ``get_final_message()``, so
+    ``timeout`` (seconds) bounds the connect and each read rather than the
+    whole generation: a long completion keeps data flowing, a stalled one
+    fails after ``timeout`` instead of the SDK's 10-minute default.
+    """
+
+    def __init__(
+        self,
+        model: str | None = None,
+        api_key: str | None = None,
+        timeout: float = 60.0,
+        max_retries: int = 2,
+    ) -> None:
         from anthropic import AsyncAnthropic  # noqa: F401
 
         self.model = model or os.environ.get("LLM_GATEWAY_MODEL", "claude-haiku-4-5-20251001")
         self._api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        self.timeout = timeout
+        self.max_retries = max_retries
 
     async def complete(self, req: LLMRequest) -> LLMResponse:
         from anthropic import AsyncAnthropic
 
-        client = AsyncAnthropic(api_key=self._api_key)
-        resp = await client.messages.create(
+        client = AsyncAnthropic(
+            api_key=self._api_key, timeout=self.timeout, max_retries=self.max_retries
+        )
+        async with client.messages.stream(
             model=req.model or self.model,
             max_tokens=req.max_tokens,
             messages=req.messages,
-        )
+        ) as stream:
+            resp = await stream.get_final_message()
         text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
         return LLMResponse(
             text=text,

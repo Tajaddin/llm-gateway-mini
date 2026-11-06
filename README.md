@@ -148,7 +148,7 @@ uvicorn.run(app, host="0.0.0.0", port=8000)
 
 * **`audit.py`** — SQLite in WAL mode. Wide row: `received_at_ms`, `completed_at_ms`, `latency_ms`, `tenant_id`, `model`, `status`, `error_kind`, `input_tokens`, `output_tokens`, `cost_cents`, `request_id`. Indexed by `(tenant_id, received_at_ms)` and `status`.
 
-* **`backends.py`** — `LLMBackend` protocol = one async `complete(LLMRequest) -> LLMResponse`. `MockBackend` (deterministic for tests + bench), `AnthropicBackend` (wraps `AsyncAnthropic.messages.create`). Backends report token counts; they do not price them.
+* **`backends.py`** — `LLMBackend` protocol = one async `complete(LLMRequest) -> LLMResponse`. `MockBackend` (deterministic for tests + bench), `AnthropicBackend` (wraps `AsyncAnthropic.messages.stream` and collects the final message, with an explicit `timeout` of 60 s per read and `max_retries=2`, so a stalled upstream fails fast while long completions still finish). Backends report token counts; they do not price them.
 
 * **`pricing.py`** — `ModelPrice(input_usd_per_mtok, output_usd_per_mtok)` as `Decimal`, so real list prices ($1 / $5 per million tokens, or $0.10) and the cost of a single token are exact. The table passed to `create_app(prices=...)` is the model allowlist: a request for any other model gets 400 before it reaches the backend, and each request is billed at its own model's price. `ANTHROPIC_PRICES` holds three Anthropic list prices for the CLI; check them against the pricing page before billing with them.
 
