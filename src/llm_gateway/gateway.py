@@ -62,7 +62,7 @@ def _estimate_input_tokens(messages: list[dict]) -> int:
     the JSON-serialized messages (tokenizers average several characters per
     token). It is only held while the request is in flight; settling swaps it
     for the backend's real count."""
-    return len(json.dumps(messages))
+    return len(json.dumps(messages, ensure_ascii=False))
 
 
 class _CompletionRequest(BaseModel):

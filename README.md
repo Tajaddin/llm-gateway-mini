@@ -2,7 +2,7 @@
 
 > Multi-tenant LLM proxy in ~800 lines: per-tenant API keys, HMAC request signing, token-bucket rate limiting, daily-token + monthly-cost quotas, append-only SQLite audit log. Concurrent benchmark: **10 tenants × 200 requests, 276 QPS, p99 = 69.2 ms** end-to-end through the full middleware stack, 0 errors, 2000 audit rows written.
 
-[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![Tests](https://img.shields.io/badge/tests-54%20passing-brightgreen)](#tests) [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]()
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![Tests](https://img.shields.io/badge/tests-55%20passing-brightgreen)](#tests) [![Python](https://img.shields.io/badge/python-3.10%2B-blue)]()
 
 ## Why this exists
 
@@ -172,14 +172,14 @@ test_audit.py         3 passed   write/count/by-tenant/by-status/latencies
 test_tenants.py       3 passed   store lookup, fresh keys per Tenant.new
 test_pricing.py       2 passed   sub-cent prices exact, float prices read as written
 test_backends.py      2 passed   Anthropic client streams with explicit timeout + retries
-test_gateway.py      17 passed   happy path, 401 unknown key, 401 bad sig, 429 rate limit,
+test_gateway.py      18 passed   happy path, 401 unknown key, 401 bad sig, 429 rate limit,
                                  402 quota, signature-disabled flag, tenant isolation,
                                  400 malformed body, /healthz, concurrent requests within budget,
                                  prompt tokens counted, reservation released on 502,
                                  400 unknown model, per-model cost, 401 before body read,
-                                 413 body cap, 401 replay
+                                 413 body cap, 401 replay, non-ASCII prompt estimate
 ─────────────────────────────────
-54 passed in 1.86s
+55 passed in 2.14s
 ```
 
 Two tests worth calling out:

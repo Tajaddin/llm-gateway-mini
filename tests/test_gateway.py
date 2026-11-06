@@ -223,6 +223,20 @@ async def test_quota_counts_prompt_tokens_not_just_max_tokens(tmp_path):
     assert backend.calls == 0
 
 
+@pytest.mark.asyncio
+async def test_non_ascii_prompt_is_estimated_at_one_token_per_character(tmp_path):
+    t = Tenant.new("t1", daily_token_budget=1_000)
+    backend = MockBackend()
+    app, _ = _unsigned_app(tmp_path, t, backend)
+    body = json.dumps(
+        {"model": "m", "messages": [{"role": "user", "content": "漢" * 500}], "max_tokens": 10}
+    ).encode()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.post("/v1/completions", content=body, headers=_auth(t))
+    assert r.status_code == 200, r.text
+    assert backend.calls == 1
+
+
 class _FailingBackend:
     async def complete(self, req):
         raise RuntimeError("upstream down")
