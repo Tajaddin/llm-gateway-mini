@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from decimal import Decimal
 
 import httpx
 import pytest
@@ -13,10 +14,13 @@ from llm_gateway import (
     AuditLog,
     HmacSigner,
     MockBackend,
+    ModelPrice,
     Tenant,
     TenantStore,
     create_app,
 )
+
+PRICES = {"m": ModelPrice("1", "5")}
 
 
 def _setup(tmp_path, *, rpm=10, require_signature=True, daily_tokens=1_000_000):
@@ -30,6 +34,7 @@ def _setup(tmp_path, *, rpm=10, require_signature=True, daily_tokens=1_000_000):
         tenants,
         backend,
         audit,
+        prices=PRICES,
         signer=signer,
         require_signature=require_signature,
     )
@@ -129,7 +134,9 @@ async def test_isolation_between_tenants(tmp_path):
     backend = MockBackend()
     audit = AuditLog(tmp_path / "audit.sqlite")
     signer = HmacSigner()
-    app = create_app(tenants, backend, audit, signer=signer, require_signature=False)
+    app = create_app(
+        tenants, backend, audit, prices=PRICES, signer=signer, require_signature=False
+    )
     body = _body()
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
         ra1 = await c.post(
@@ -175,11 +182,11 @@ async def test_healthz(tmp_path):
     assert j["tenants"] == 1
 
 
-def _unsigned_app(tmp_path, tenant, backend):
+def _unsigned_app(tmp_path, tenant, backend, prices=PRICES):
     tenants = TenantStore()
     tenants.add(tenant)
     audit = AuditLog(tmp_path / "audit.sqlite")
-    return create_app(tenants, backend, audit, require_signature=False), audit
+    return create_app(tenants, backend, audit, prices=prices, require_signature=False), audit
 
 
 def _auth(tenant):
@@ -229,3 +236,35 @@ async def test_backend_error_releases_the_reservation(tmp_path):
         r = await c.post("/v1/completions", content=_body(), headers=_auth(t))
     assert r.status_code == 502
     assert app.state.quota.snapshot("t1")["tokens_today"] == 0
+
+
+@pytest.mark.asyncio
+async def test_model_outside_the_price_table_is_rejected(tmp_path):
+    t = Tenant.new("t1")
+    backend = MockBackend()
+    app, audit = _unsigned_app(tmp_path, t, backend)
+    body = json.dumps({"model": "some-expensive-model", "messages": [{"role": "user", "content": "hi"}]})
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.post("/v1/completions", content=body, headers=_auth(t))
+    assert r.status_code == 400
+    assert backend.calls == 0
+    assert audit.count_by_status("denied") == 1
+
+
+@pytest.mark.asyncio
+async def test_cost_follows_the_requested_models_price(tmp_path):
+    t = Tenant.new("t1")
+    prices = {"cheap": ModelPrice("1", "5"), "pricey": ModelPrice("15", "75")}
+    app, _ = _unsigned_app(tmp_path, t, MockBackend(), prices=prices)
+    costs = {}
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+        for model in prices:
+            # MockBackend: 4,000 chars -> 1,000 input tokens; output capped at max_tokens.
+            body = json.dumps(
+                {"model": model, "messages": [{"role": "user", "content": "x" * 4_000}], "max_tokens": 1_000}
+            )
+            r = await c.post("/v1/completions", content=body, headers=_auth(t))
+            assert r.status_code == 200, r.text
+            costs[model] = r.json()["usage"]["cost_cents"]
+    assert costs == {"cheap": 0.6, "pricey": 9.0}
+    assert app.state.quota.snapshot("t1")["cost_cents_this_month"] == Decimal("9.6")

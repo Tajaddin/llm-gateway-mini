@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as _dt
 import threading
 from dataclasses import dataclass
+from decimal import Decimal
 
 from llm_gateway.tenants import Tenant
 
@@ -28,7 +29,7 @@ from llm_gateway.tenants import Tenant
 class QuotaExceeded(Exception):
     """Raised when a tenant is over its daily-token or monthly-cost budget."""
 
-    def __init__(self, kind: str, used: int, limit: int) -> None:
+    def __init__(self, kind: str, used: int | Decimal, limit: int) -> None:
         self.kind = kind
         self.used = used
         self.limit = limit
@@ -43,7 +44,7 @@ class Reservation:
     day: str
     month: str
     tokens: int
-    cost_cents: int
+    cost_cents: Decimal
 
 
 @dataclass
@@ -51,7 +52,7 @@ class _Usage:
     day: str
     month: str
     tokens_today: int = 0
-    cost_cents_this_month: int = 0
+    cost_cents_this_month: Decimal = Decimal(0)
 
 
 def _today_key() -> str:
@@ -85,12 +86,12 @@ class QuotaEnforcer:
             u.cost_cents_this_month = 0
         return u
 
-    def check(self, tenant: Tenant, requested_tokens: int, est_cost_cents: int) -> None:
+    def check(self, tenant: Tenant, requested_tokens: int, est_cost_cents: Decimal) -> None:
         """Raise :class:`QuotaExceeded` if the request would push past a limit."""
         with self._lock:
             self._check(self._slot(tenant.tenant_id), tenant, requested_tokens, est_cost_cents)
 
-    def reserve(self, tenant: Tenant, tokens: int, cost_cents: int) -> Reservation:
+    def reserve(self, tenant: Tenant, tokens: int, cost_cents: Decimal) -> Reservation:
         """Check an estimate against the budget and hold it, atomically."""
         with self._lock:
             u = self._slot(tenant.tenant_id)
@@ -99,22 +100,22 @@ class QuotaEnforcer:
             u.cost_cents_this_month += cost_cents
             return Reservation(tenant.tenant_id, u.day, u.month, tokens, cost_cents)
 
-    def settle(self, reservation: Reservation, tokens: int, cost_cents: int) -> None:
+    def settle(self, reservation: Reservation, tokens: int, cost_cents: Decimal) -> None:
         """Replace a reservation's estimate with the usage actually incurred."""
         with self._lock:
             u = self._slot(reservation.tenant_id)
             # A day or month reset since the reservation already dropped it.
             held_tokens = reservation.tokens if u.day == reservation.day else 0
-            held_cost = reservation.cost_cents if u.month == reservation.month else 0
+            held_cost = reservation.cost_cents if u.month == reservation.month else Decimal(0)
             u.tokens_today += tokens - held_tokens
             u.cost_cents_this_month += cost_cents - held_cost
 
     def release(self, reservation: Reservation) -> None:
         """Drop a reservation for a request that got no response."""
-        self.settle(reservation, tokens=0, cost_cents=0)
+        self.settle(reservation, tokens=0, cost_cents=Decimal(0))
 
     @staticmethod
-    def _check(u: _Usage, tenant: Tenant, requested_tokens: int, est_cost_cents: int) -> None:
+    def _check(u: _Usage, tenant: Tenant, requested_tokens: int, est_cost_cents: Decimal) -> None:
         if u.tokens_today + requested_tokens > tenant.daily_token_budget:
             raise QuotaExceeded(
                 kind="daily_tokens",
@@ -128,7 +129,7 @@ class QuotaEnforcer:
                 limit=tenant.monthly_cost_cents,
             )
 
-    def record(self, tenant: Tenant, tokens: int, cost_cents: int) -> None:
+    def record(self, tenant: Tenant, tokens: int, cost_cents: Decimal) -> None:
         with self._lock:
             u = self._slot(tenant.tenant_id)
             u.tokens_today += tokens

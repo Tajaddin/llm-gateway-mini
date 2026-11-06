@@ -10,6 +10,7 @@ import uvicorn
 from llm_gateway.audit import AuditLog
 from llm_gateway.backends import AnthropicBackend, MockBackend
 from llm_gateway.gateway import create_app
+from llm_gateway.pricing import ANTHROPIC_PRICES
 from llm_gateway.tenants import Tenant, TenantStore
 
 
@@ -37,7 +38,13 @@ def cli() -> None:
         backend = MockBackend(latency_ms=10, jitter_ms=5)
 
     audit = AuditLog(args.audit_db)
-    app = create_app(tenants, backend, audit, require_signature=not args.no_signature)
+    app = create_app(
+        tenants,
+        backend,
+        audit,
+        prices=ANTHROPIC_PRICES,
+        require_signature=not args.no_signature,
+    )
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
 
 

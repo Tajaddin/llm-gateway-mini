@@ -7,6 +7,7 @@ Request lifecycle for ``POST /v1/completions``:
 3. Acquire one token from the tenant's rate-limit bucket. 429 on empty.
 4. Reserve the estimated tokens + cost against the quota (prompt estimate
    plus ``max_tokens``). 402 if the reservation would pass a budget.
+   Unknown models (not in the price table) are rejected with 400 first.
 5. Forward to the LLM backend, await response.
 6. Settle the reservation to the real usage and write an audit row; a
    failed backend call releases it instead.
@@ -21,6 +22,7 @@ import asyncio
 import json
 import secrets
 import time
+from collections.abc import Mapping
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -28,6 +30,7 @@ from pydantic import BaseModel, Field
 
 from llm_gateway.audit import AuditLog, AuditRecord
 from llm_gateway.backends import LLMBackend, LLMRequest
+from llm_gateway.pricing import ModelPrice
 from llm_gateway.quota import QuotaEnforcer, QuotaExceeded
 from llm_gateway.rate_limit import RateLimitExceeded, TokenBucket
 from llm_gateway.signing import HmacSigner, SignatureInvalid
@@ -57,6 +60,7 @@ def create_app(
     backend: LLMBackend,
     audit_log: AuditLog,
     *,
+    prices: Mapping[str, ModelPrice],
     quota: QuotaEnforcer | None = None,
     signer: HmacSigner | None = None,
     require_signature: bool = True,
@@ -99,7 +103,7 @@ def create_app(
         api_key = auth[len("Bearer ") :].strip() if auth.startswith("Bearer ") else ""
         tenant = tenants.get_by_key(api_key) if api_key else None
 
-        def _audit(status: str, error_kind: str | None, model: str, in_t=0, out_t=0, cost=0):
+        def _audit(status: str, error_kind: str | None, model: str, in_t=0, out_t=0, cost=0.0):
             audit_log.write(
                 AuditRecord(
                     received_at_ms=received_at_ms,
@@ -144,8 +148,14 @@ def create_app(
             _audit("denied", "bad_request", model="-")
             raise HTTPException(status_code=400, detail=str(exc))
 
-        est_tokens = _estimate_input_tokens(parsed.messages) + parsed.max_tokens
-        est_cost = max(1, est_tokens // 1000 * 125)
+        price = prices.get(parsed.model)
+        if price is None:
+            _audit("denied", "unknown_model", model=parsed.model)
+            raise HTTPException(status_code=400, detail=f"model not allowed: {parsed.model}")
+
+        est_input = _estimate_input_tokens(parsed.messages)
+        est_tokens = est_input + parsed.max_tokens
+        est_cost = price.cost_cents(est_input, parsed.max_tokens)
         try:
             reservation = quota.reserve(tenant, tokens=est_tokens, cost_cents=est_cost)
         except QuotaExceeded as exc:
@@ -168,16 +178,16 @@ def create_app(
             _audit("error", "backend_error", model=parsed.model)
             raise HTTPException(status_code=502, detail=str(exc))
 
-        quota.settle(
-            reservation, tokens=resp.input_tokens + resp.output_tokens, cost_cents=resp.cost_cents
-        )
+        # Billed at the price of the model the tenant asked for and was allowed.
+        cost = price.cost_cents(resp.input_tokens, resp.output_tokens)
+        quota.settle(reservation, tokens=resp.input_tokens + resp.output_tokens, cost_cents=cost)
         _audit(
             "ok",
             error_kind=None,
             model=resp.model,
             in_t=resp.input_tokens,
             out_t=resp.output_tokens,
-            cost=resp.cost_cents,
+            cost=float(cost),
         )
         return JSONResponse(
             {
@@ -187,7 +197,7 @@ def create_app(
                 "usage": {
                     "input_tokens": resp.input_tokens,
                     "output_tokens": resp.output_tokens,
-                    "cost_cents": resp.cost_cents,
+                    "cost_cents": float(cost),
                 },
             }
         )

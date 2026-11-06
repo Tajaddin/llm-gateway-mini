@@ -71,13 +71,13 @@ Response status codes:
 | Code | When |
 |---|---|
 | 200 | Backend completed; usage recorded; audit row `status=ok` |
-| 400 | Body failed Pydantic validation |
+| 400 | Body failed Pydantic validation, or `model` is not in the gateway's price table |
 | 401 | Unknown API key OR signature invalid OR timestamp out of skew tolerance |
 | 402 | Daily-token or monthly-cost quota would be exceeded by this request |
 | 429 | Token bucket empty for this tenant |
 | 502 | Backend raised |
 
-Every code (even rejections) writes one row to `audit` with a named `error_kind`: `unknown_tenant`, `bad_signature`, `rate_limited`, `quota_daily_tokens`, `quota_monthly_cost`, `backend_error`, `bad_request`.
+Every code (even rejections) writes one row to `audit` with a named `error_kind`: `unknown_tenant`, `bad_signature`, `rate_limited`, `quota_daily_tokens`, `quota_monthly_cost`, `backend_error`, `bad_request`, `unknown_model`.
 
 ## Quickstart
 
@@ -112,7 +112,7 @@ Programmatic embed:
 
 ```python
 from llm_gateway import (
-    AuditLog, HmacSigner, MockBackend, Tenant, TenantStore, create_app,
+    AuditLog, HmacSigner, MockBackend, ModelPrice, Tenant, TenantStore, create_app,
 )
 import uvicorn
 
@@ -125,6 +125,8 @@ app = create_app(
     tenants,
     MockBackend(latency_ms=10),
     AuditLog("audit.sqlite"),
+    # The price table is also the allowlist: other models get 400.
+    prices={"claude-haiku-4-5-20251001": ModelPrice("1", "5")},  # USD per million tokens
     signer=HmacSigner(max_skew_seconds=300),
     require_signature=True,
 )
@@ -143,7 +145,9 @@ uvicorn.run(app, host="0.0.0.0", port=8000)
 
 * **`audit.py`** — SQLite in WAL mode. Wide row: `received_at_ms`, `completed_at_ms`, `latency_ms`, `tenant_id`, `model`, `status`, `error_kind`, `input_tokens`, `output_tokens`, `cost_cents`, `request_id`. Indexed by `(tenant_id, received_at_ms)` and `status`.
 
-* **`backends.py`** — `LLMBackend` protocol = one async `complete(LLMRequest) -> LLMResponse`. `MockBackend` (deterministic for tests + bench), `AnthropicBackend` (wraps `AsyncAnthropic.messages.create`). Cost computed from input/output tokens × per-1k-token cents.
+* **`backends.py`** — `LLMBackend` protocol = one async `complete(LLMRequest) -> LLMResponse`. `MockBackend` (deterministic for tests + bench), `AnthropicBackend` (wraps `AsyncAnthropic.messages.create`). Backends report token counts; they do not price them.
+
+* **`pricing.py`** — `ModelPrice(input_usd_per_mtok, output_usd_per_mtok)` as `Decimal`, so real list prices ($1 / $5 per million tokens, or $0.10) and the cost of a single token are exact. The table passed to `create_app(prices=...)` is the model allowlist: a request for any other model gets 400 before it reaches the backend, and each request is billed at its own model's price. `ANTHROPIC_PRICES` holds three Anthropic list prices for the CLI; check them against the pricing page before billing with them.
 
 * **`gateway.py`** — FastAPI app. `POST /v1/completions` runs the six concerns in order, writes one audit row per request (success or failure), returns JSON. Health check at `/healthz`.
 

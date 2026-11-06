@@ -8,6 +8,7 @@ Exports:
 * :class:`HmacSigner` — request signing + verification.
 * :class:`AuditLog` — append-only SQLite log of every request.
 * :class:`MockBackend`, :class:`AnthropicBackend` — pluggable LLM providers.
+* :class:`ModelPrice`, ``ANTHROPIC_PRICES`` — per-model prices; the table is the model allowlist.
 * :func:`create_app` — FastAPI app factory.
 """
 
@@ -20,12 +21,14 @@ from llm_gateway.backends import (
     MockBackend,
 )
 from llm_gateway.gateway import GatewayError, create_app
+from llm_gateway.pricing import ANTHROPIC_PRICES, ModelPrice
 from llm_gateway.quota import QuotaEnforcer, QuotaExceeded
 from llm_gateway.rate_limit import RateLimitExceeded, TokenBucket
 from llm_gateway.signing import HmacSigner, SignatureInvalid
 from llm_gateway.tenants import Tenant, TenantStore
 
 __all__ = [
+    "ANTHROPIC_PRICES",
     "AnthropicBackend",
     "AuditLog",
     "AuditRecord",
@@ -35,6 +38,7 @@ __all__ = [
     "LLMRequest",
     "LLMResponse",
     "MockBackend",
+    "ModelPrice",
     "QuotaEnforcer",
     "QuotaExceeded",
     "RateLimitExceeded",
