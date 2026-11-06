@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 
@@ -172,3 +173,59 @@ async def test_healthz(tmp_path):
     j = r.json()
     assert j["status"] == "ok"
     assert j["tenants"] == 1
+
+
+def _unsigned_app(tmp_path, tenant, backend):
+    tenants = TenantStore()
+    tenants.add(tenant)
+    audit = AuditLog(tmp_path / "audit.sqlite")
+    return create_app(tenants, backend, audit, require_signature=False), audit
+
+
+def _auth(tenant):
+    return {"Authorization": f"Bearer {tenant.api_key}", "Content-Type": "application/json"}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_requests_cannot_overspend_the_daily_budget(tmp_path):
+    t = Tenant.new("t1", rpm=100, rps=100, daily_token_budget=2_000)
+    app, _ = _unsigned_app(tmp_path, t, MockBackend(latency_ms=50))
+    body = json.dumps(
+        {"model": "m", "messages": [{"role": "user", "content": "x" * 400}], "max_tokens": 100}
+    ).encode()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+        rs = await asyncio.gather(
+            *[c.post("/v1/completions", content=body, headers=_auth(t)) for _ in range(20)]
+        )
+    codes = [r.status_code for r in rs]
+    assert 200 in codes and 402 in codes
+    assert app.state.quota.snapshot("t1")["tokens_today"] <= t.daily_token_budget
+
+
+@pytest.mark.asyncio
+async def test_quota_counts_prompt_tokens_not_just_max_tokens(tmp_path):
+    t = Tenant.new("t1", daily_token_budget=1_000)
+    backend = MockBackend()
+    app, audit = _unsigned_app(tmp_path, t, backend)
+    body = json.dumps(
+        {"model": "m", "messages": [{"role": "user", "content": "x" * 8_000}], "max_tokens": 10}
+    ).encode()
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.post("/v1/completions", content=body, headers=_auth(t))
+    assert r.status_code == 402
+    assert backend.calls == 0
+
+
+class _FailingBackend:
+    async def complete(self, req):
+        raise RuntimeError("upstream down")
+
+
+@pytest.mark.asyncio
+async def test_backend_error_releases_the_reservation(tmp_path):
+    t = Tenant.new("t1")
+    app, _ = _unsigned_app(tmp_path, t, _FailingBackend())
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as c:
+        r = await c.post("/v1/completions", content=_body(), headers=_auth(t))
+    assert r.status_code == 502
+    assert app.state.quota.snapshot("t1")["tokens_today"] == 0

@@ -137,7 +137,7 @@ uvicorn.run(app, host="0.0.0.0", port=8000)
 
 * **`rate_limit.py`** — `TokenBucket(capacity, refill_per_second)`. `acquire(n)` non-blocking, returns True/False; `acquire_or_raise` raises `RateLimitExceeded`. Refill computed lazily from `time.monotonic()` deltas, no background thread.
 
-* **`quota.py`** — `QuotaEnforcer.check(...)` raises `QuotaExceeded(kind=...)` if the request would push the tenant past its `daily_token_budget` (UTC day-aligned) or `monthly_cost_cents` (UTC month-aligned). Counters reset at the day/month boundary on next access — no scheduler required.
+* **`quota.py`** — `QuotaEnforcer.reserve(...)` checks an estimate against the tenant's `daily_token_budget` (UTC day-aligned) and `monthly_cost_cents` (UTC month-aligned) and holds it in the same locked step, raising `QuotaExceeded(kind=...)` if it does not fit. Concurrent requests therefore see each other's holds. `settle(...)` swaps the hold for the real usage once the backend replies; `release(...)` drops it if the call failed. Counters reset at the day/month boundary on next access — no scheduler required.
 
 * **`signing.py`** — `HmacSigner.sign(secret, body, timestamp)` returns `{X-Timestamp, X-Signature}`. `verify(...)` checks HMAC-SHA256 against `"{ts}.".encode() + body` and rejects if `|now - ts| > max_skew_seconds` (default 300). Uses `hmac.compare_digest` (constant time).
 
@@ -197,7 +197,7 @@ Two tests worth calling out:
 
 **Token-bucket only.** No leaky-bucket / sliding-window. Token bucket is the right primitive for "small burst OK, sustained spam not OK"; if you need stricter sustained smoothing, sliding-window is a 30-line addition.
 
-**Quota check is pre-flight only.** It uses `max_tokens` as the upper bound. A model that returns fewer tokens than requested is correctly billed at the real number in `record(...)`, but the *pre-check* rejects on the upper bound. That's intentional — better to reject early than to bill a customer past their plan.
+**Quota reservations are estimates.** Each request reserves a deliberately high estimate — one token per character of the JSON-serialized messages, plus `max_tokens` — before the backend call, and settles to the real token count afterwards. A request whose estimate does not fit the remaining budget is rejected even if its real usage would have fit. That's intentional — better to reject early than to bill a customer past their plan. The prompt estimate is a heuristic, not a tokenizer: if a prompt ever tokenizes to more than its character count, that request can overshoot the budget by the difference.
 
 **No request streaming.** This endpoint returns the full response in one shot. For SSE streaming, the same middleware stack composes onto an EventSourceResponse — see [stream-llm-fastapi](https://github.com/Tajaddin/stream-llm-fastapi) for the SSE half of this pair.
 

@@ -5,9 +5,11 @@ Request lifecycle for ``POST /v1/completions``:
 1. Read API key from ``Authorization: Bearer <api_key>``. 401 if unknown.
 2. Verify HMAC signature against the raw body + ``X-Timestamp``. 401 on fail.
 3. Acquire one token from the tenant's rate-limit bucket. 429 on empty.
-4. Pre-flight quota check (estimated tokens + cost). 402 on exceeded.
+4. Reserve the estimated tokens + cost against the quota (prompt estimate
+   plus ``max_tokens``). 402 if the reservation would pass a budget.
 5. Forward to the LLM backend, await response.
-6. Record real usage in the quota counters and write an audit row.
+6. Settle the reservation to the real usage and write an audit row; a
+   failed backend call releases it instead.
 7. Return the response body.
 
 Failures at any step write an audit row with a named ``error_kind``.
@@ -34,6 +36,14 @@ from llm_gateway.tenants import Tenant, TenantStore
 
 class GatewayError(Exception):
     pass
+
+
+def _estimate_input_tokens(messages: list[dict]) -> int:
+    """A deliberately high prompt-size estimate: one token per character of
+    the JSON-serialized messages (tokenizers average several characters per
+    token). It is only held while the request is in flight; settling swaps it
+    for the backend's real count."""
+    return len(json.dumps(messages))
 
 
 class _CompletionRequest(BaseModel):
@@ -134,10 +144,10 @@ def create_app(
             _audit("denied", "bad_request", model="-")
             raise HTTPException(status_code=400, detail=str(exc))
 
-        est_tokens = parsed.max_tokens
+        est_tokens = _estimate_input_tokens(parsed.messages) + parsed.max_tokens
         est_cost = max(1, est_tokens // 1000 * 125)
         try:
-            quota.check(tenant, requested_tokens=est_tokens, est_cost_cents=est_cost)
+            reservation = quota.reserve(tenant, tokens=est_tokens, cost_cents=est_cost)
         except QuotaExceeded as exc:
             _audit("denied", f"quota_{exc.kind}", model=parsed.model)
             raise HTTPException(status_code=402, detail=str(exc))
@@ -150,11 +160,17 @@ def create_app(
                     max_tokens=parsed.max_tokens,
                 )
             )
+        except asyncio.CancelledError:
+            quota.release(reservation)
+            raise
         except Exception as exc:  # noqa: BLE001
+            quota.release(reservation)
             _audit("error", "backend_error", model=parsed.model)
             raise HTTPException(status_code=502, detail=str(exc))
 
-        quota.record(tenant, tokens=resp.input_tokens + resp.output_tokens, cost_cents=resp.cost_cents)
+        quota.settle(
+            reservation, tokens=resp.input_tokens + resp.output_tokens, cost_cents=resp.cost_cents
+        )
         _audit(
             "ok",
             error_kind=None,

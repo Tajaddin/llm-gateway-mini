@@ -50,3 +50,31 @@ def test_tenants_isolated():
     t2 = Tenant.new("b", daily_token_budget=100)
     q.record(t1, tokens=99, cost_cents=0)
     q.check(t2, requested_tokens=99, est_cost_cents=0)  # must not raise
+
+
+def test_reserve_holds_budget_until_settled():
+    q = QuotaEnforcer()
+    t = _tenant()
+    q.reserve(t, tokens=600, cost_cents=10)
+    with pytest.raises(QuotaExceeded) as exc:
+        q.reserve(t, tokens=600, cost_cents=10)
+    assert exc.value.kind == "daily_tokens"
+
+
+def test_settle_replaces_the_estimate_with_real_usage():
+    q = QuotaEnforcer()
+    t = _tenant()
+    r = q.reserve(t, tokens=600, cost_cents=100)
+    q.settle(r, tokens=150, cost_cents=20)
+    snap = q.snapshot("t1")
+    assert snap["tokens_today"] == 150
+    assert snap["cost_cents_this_month"] == 20
+
+
+def test_release_returns_the_reservation():
+    q = QuotaEnforcer()
+    t = _tenant()
+    r = q.reserve(t, tokens=600, cost_cents=100)
+    q.release(r)
+    assert q.snapshot("t1")["tokens_today"] == 0
+    q.reserve(t, tokens=1000, cost_cents=500)  # whole budget is free again
