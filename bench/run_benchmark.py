@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import httpx
 
 from llm_gateway import (
+    ANTHROPIC_PRICES,
     AuditLog,
     HmacSigner,
     MockBackend,
@@ -75,10 +76,16 @@ async def run(args) -> dict:
         audit_path.unlink()
     audit = AuditLog(audit_path)
     signer = HmacSigner()
-    app = create_app(tenants, backend, audit, signer=signer, require_signature=True)
+    app = create_app(
+        tenants, backend, audit, prices=ANTHROPIC_PRICES, signer=signer, require_signature=True
+    )
 
     body = json.dumps(
-        {"model": "m", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 8}
+        {
+            "model": "claude-haiku-4-5-20251001",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 8,
+        }
     ).encode()
 
     latencies: list[float] = []

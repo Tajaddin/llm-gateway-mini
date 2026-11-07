@@ -2,12 +2,18 @@
 
 Request lifecycle for ``POST /v1/completions``:
 
-1. Read API key from ``Authorization: Bearer <api_key>``. 401 if unknown.
-2. Verify HMAC signature against the raw body + ``X-Timestamp``. 401 on fail.
+1. Read API key from ``Authorization: Bearer <api_key>``. 401 if unknown,
+   before any of the body is read.
+2. Read the body, at most ``max_body_bytes`` (413 past that), and verify the
+   HMAC signature over it + ``X-Timestamp`` + ``X-Nonce``. 401 on fail, or if
+   the same signed request was already accepted (replay).
 3. Acquire one token from the tenant's rate-limit bucket. 429 on empty.
-4. Pre-flight quota check (estimated tokens + cost). 402 on exceeded.
+4. Reserve the estimated tokens + cost against the quota (prompt estimate
+   plus ``max_tokens``). 402 if the reservation would pass a budget.
+   Unknown models (not in the price table) are rejected with 400 first.
 5. Forward to the LLM backend, await response.
-6. Record real usage in the quota counters and write an audit row.
+6. Settle the reservation to the real usage and write an audit row; a
+   failed backend call releases it instead.
 7. Return the response body.
 
 Failures at any step write an audit row with a named ``error_kind``.
@@ -19,6 +25,7 @@ import asyncio
 import json
 import secrets
 import time
+from collections.abc import Mapping
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -26,6 +33,7 @@ from pydantic import BaseModel, Field
 
 from llm_gateway.audit import AuditLog, AuditRecord
 from llm_gateway.backends import LLMBackend, LLMRequest
+from llm_gateway.pricing import ModelPrice
 from llm_gateway.quota import QuotaEnforcer, QuotaExceeded
 from llm_gateway.rate_limit import RateLimitExceeded, TokenBucket
 from llm_gateway.signing import HmacSigner, SignatureInvalid
@@ -34,6 +42,27 @@ from llm_gateway.tenants import Tenant, TenantStore
 
 class GatewayError(Exception):
     pass
+
+
+async def _read_body(request: Request, limit: int) -> bytes | None:
+    """The request body, or None as soon as it is known to exceed ``limit``."""
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > limit:
+        return None
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > limit:
+            return None
+    return bytes(body)
+
+
+def _estimate_input_tokens(messages: list[dict]) -> int:
+    """A deliberately high prompt-size estimate: one token per character of
+    the JSON-serialized messages (tokenizers average several characters per
+    token). It is only held while the request is in flight; settling swaps it
+    for the backend's real count."""
+    return len(json.dumps(messages, ensure_ascii=False))
 
 
 class _CompletionRequest(BaseModel):
@@ -47,10 +76,12 @@ def create_app(
     backend: LLMBackend,
     audit_log: AuditLog,
     *,
+    prices: Mapping[str, ModelPrice],
     quota: QuotaEnforcer | None = None,
     signer: HmacSigner | None = None,
     require_signature: bool = True,
     rate_limit_cost_per_request: float = 1.0,
+    max_body_bytes: int = 1024 * 1024,
 ) -> FastAPI:
     quota = quota or QuotaEnforcer()
     signer = signer or HmacSigner()
@@ -83,13 +114,12 @@ def create_app(
     async def completions(request: Request):
         received_at_ms = int(time.time() * 1000)
         request_id = secrets.token_urlsafe(12)
-        body = await request.body()
 
         auth = request.headers.get("authorization", "")
         api_key = auth[len("Bearer ") :].strip() if auth.startswith("Bearer ") else ""
         tenant = tenants.get_by_key(api_key) if api_key else None
 
-        def _audit(status: str, error_kind: str | None, model: str, in_t=0, out_t=0, cost=0):
+        def _audit(status: str, error_kind: str | None, model: str, in_t=0, out_t=0, cost=0.0):
             audit_log.write(
                 AuditRecord(
                     received_at_ms=received_at_ms,
@@ -109,6 +139,13 @@ def create_app(
             _audit("denied", "unknown_tenant", model="-")
             raise HTTPException(status_code=401, detail="unknown api key")
 
+        body = await _read_body(request, max_body_bytes)
+        if body is None:
+            _audit("denied", "body_too_large", model="-")
+            raise HTTPException(
+                status_code=413, detail=f"request body exceeds {max_body_bytes} bytes"
+            )
+
         if require_signature:
             try:
                 signer.verify(
@@ -116,6 +153,7 @@ def create_app(
                     body,
                     timestamp_header=request.headers.get("x-timestamp"),
                     signature_header=request.headers.get("x-signature"),
+                    nonce_header=request.headers.get("x-nonce"),
                 )
             except SignatureInvalid as exc:
                 _audit("denied", "bad_signature", model="-")
@@ -134,10 +172,16 @@ def create_app(
             _audit("denied", "bad_request", model="-")
             raise HTTPException(status_code=400, detail=str(exc))
 
-        est_tokens = parsed.max_tokens
-        est_cost = max(1, est_tokens // 1000 * 125)
+        price = prices.get(parsed.model)
+        if price is None:
+            _audit("denied", "unknown_model", model=parsed.model)
+            raise HTTPException(status_code=400, detail=f"model not allowed: {parsed.model}")
+
+        est_input = _estimate_input_tokens(parsed.messages)
+        est_tokens = est_input + parsed.max_tokens
+        est_cost = price.cost_cents(est_input, parsed.max_tokens)
         try:
-            quota.check(tenant, requested_tokens=est_tokens, est_cost_cents=est_cost)
+            reservation = quota.reserve(tenant, tokens=est_tokens, cost_cents=est_cost)
         except QuotaExceeded as exc:
             _audit("denied", f"quota_{exc.kind}", model=parsed.model)
             raise HTTPException(status_code=402, detail=str(exc))
@@ -150,18 +194,24 @@ def create_app(
                     max_tokens=parsed.max_tokens,
                 )
             )
+        except asyncio.CancelledError:
+            quota.release(reservation)
+            raise
         except Exception as exc:  # noqa: BLE001
+            quota.release(reservation)
             _audit("error", "backend_error", model=parsed.model)
             raise HTTPException(status_code=502, detail=str(exc))
 
-        quota.record(tenant, tokens=resp.input_tokens + resp.output_tokens, cost_cents=resp.cost_cents)
+        # Billed at the price of the model the tenant asked for and was allowed.
+        cost = price.cost_cents(resp.input_tokens, resp.output_tokens)
+        quota.settle(reservation, tokens=resp.input_tokens + resp.output_tokens, cost_cents=cost)
         _audit(
             "ok",
             error_kind=None,
             model=resp.model,
             in_t=resp.input_tokens,
             out_t=resp.output_tokens,
-            cost=resp.cost_cents,
+            cost=float(cost),
         )
         return JSONResponse(
             {
@@ -171,7 +221,7 @@ def create_app(
                 "usage": {
                     "input_tokens": resp.input_tokens,
                     "output_tokens": resp.output_tokens,
-                    "cost_cents": resp.cost_cents,
+                    "cost_cents": float(cost),
                 },
             }
         )

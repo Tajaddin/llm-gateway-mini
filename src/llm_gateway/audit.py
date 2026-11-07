@@ -26,7 +26,7 @@ CREATE TABLE IF NOT EXISTS audit (
     error_kind      TEXT,
     input_tokens    INTEGER NOT NULL DEFAULT 0,
     output_tokens   INTEGER NOT NULL DEFAULT 0,
-    cost_cents      INTEGER NOT NULL DEFAULT 0,
+    cost_cents      REAL NOT NULL DEFAULT 0,
     request_id      TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS audit_tenant_time ON audit (tenant_id, received_at_ms);
@@ -45,7 +45,7 @@ class AuditRecord:
     error_kind: str | None = None
     input_tokens: int = 0
     output_tokens: int = 0
-    cost_cents: int = 0
+    cost_cents: float = 0
 
     @property
     def latency_ms(self) -> int:
